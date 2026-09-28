@@ -36,6 +36,9 @@ pub enum RefundStatus {
     Rejected,
     Processed,
     PendingAppeal,
+    /// Terminal: the merchant's denial was upheld on appeal and can no
+    /// longer be appealed, escalated, or finalized.
+    PermanentlyDenied,
 }
 
 // Issue #397: canonical reason codes, enforced by the type system on Refund and
@@ -1792,7 +1795,7 @@ impl RefundContract {
                             pending_count += 1;
                             pending_amount += refund.amount;
                         }
-                        RefundStatus::Rejected => {
+                        RefundStatus::Rejected | RefundStatus::PermanentlyDenied => {
                             total_rejected += 1;
                         }
                         RefundStatus::Processed => {

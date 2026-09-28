@@ -2063,7 +2063,7 @@ fn test_arbitration_outcome_execution_rejected() {
 }
 
 #[test]
-fn test_file_and_resolve_appeal_upheld_processes_refund() {
+fn test_file_and_resolve_appeal_upheld_approves_refund() {
     let env = Env::default();
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
@@ -2101,8 +2101,10 @@ fn test_file_and_resolve_appeal_upheld_processes_refund() {
     assert_eq!(resolved.resolved, true);
     assert_eq!(resolved.outcome, Some(true));
 
+    // Overturning the denial makes the refund payable again; payout still
+    // goes through process_refund.
     let refund = client.get_refund(&refund_id);
-    assert_eq!(refund.status, RefundStatus::Processed);
+    assert_eq!(refund.status, RefundStatus::Approved);
 }
 
 #[test]
@@ -2181,7 +2183,7 @@ fn test_file_duplicate_appeal_should_fail() {
 }
 
 #[test]
-fn test_resolve_appeal_rejected_keeps_refund_rejected() {
+fn test_resolve_appeal_rejected_permanently_denies_refund() {
     let env = Env::default();
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
@@ -2213,9 +2215,186 @@ fn test_resolve_appeal_rejected_keeps_refund_rejected() {
     client.resolve_appeal(&admin, &appeal_id, &false);
 
     let refund = client.get_refund(&refund_id);
-    assert_eq!(refund.status, RefundStatus::Rejected);
+    assert_eq!(refund.status, RefundStatus::PermanentlyDenied);
 
     let resolved = client.get_appeal(&appeal_id);
     assert_eq!(resolved.resolved, true);
     assert_eq!(resolved.outcome, Some(false));
+}
+
+// ── Appeal outcome → refund status sync ─────────────────────────────────────
+
+/// Creates a refund and rejects it, leaving it in `PendingAppeal`.
+fn setup_denied_refund(
+    env: &Env,
+) -> (RefundContractClient<'_>, Address, Address, Address, u64) {
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(env, &contract_id);
+
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+
+    let admin = Address::generate(env);
+    client.initialize(&admin);
+
+    let merchant = Address::generate(env);
+    let customer = Address::generate(env);
+    let token_admin = Address::generate(env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    soroban_sdk::token::StellarAssetClient::new(env, &token).mint(&contract_id, &10_000);
+
+    let refund_id = client.request_refund(
+        &merchant,
+        &77u64,
+        &customer,
+        &400i128,
+        &1_000i128,
+        &token,
+        &String::from_str(env, "damaged"),
+        &RefundReasonCode::ProductDefect,
+        &env.ledger().timestamp(),
+    );
+    client.reject_refund(&admin, &refund_id, &String::from_str(env, "no evidence"));
+    assert_eq!(
+        client.get_refund(&refund_id).status,
+        RefundStatus::PendingAppeal
+    );
+
+    (client, admin, customer, token, refund_id)
+}
+
+#[test]
+fn test_appeal_overturned_moves_refund_to_approved_and_allows_payout() {
+    let env = Env::default();
+    let (client, admin, customer, token, refund_id) = setup_denied_refund(&env);
+
+    let appeal_id = client.file_appeal(&customer, &refund_id, &String::from_str(&env, "photos"));
+    env.ledger().set_timestamp(2_000);
+    client.resolve_appeal(&admin, &appeal_id, &true);
+
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::Approved);
+    assert_eq!(refund.approved_at, Some(2_000));
+    assert_eq!(refund.appeal_deadline, None);
+    // The original denial is kept for auditing.
+    assert_eq!(refund.rejected_by, Some(admin.clone()));
+
+    // Status indexes follow the transition.
+    assert_eq!(client.get_refund_count_by_status(&RefundStatus::PendingAppeal), 0);
+    assert_eq!(client.get_refund_count_by_status(&RefundStatus::Approved), 1);
+
+    // Refund-cap usage was still held during the appeal and is unchanged.
+    assert_eq!(client.get_payment_refund_usage(&77u64), (1u32, 400i128));
+
+    // The approved refund can now be paid out through the normal path.
+    client.process_refund(&admin, &refund_id);
+    assert_eq!(client.get_refund(&refund_id).status, RefundStatus::Processed);
+    assert_eq!(
+        soroban_sdk::token::Client::new(&env, &token).balance(&customer),
+        400
+    );
+}
+
+#[test]
+fn test_appeal_upheld_moves_refund_to_permanently_denied() {
+    let env = Env::default();
+    let (client, admin, customer, _token, refund_id) = setup_denied_refund(&env);
+
+    let appeal_id = client.file_appeal(&customer, &refund_id, &String::from_str(&env, "photos"));
+    env.ledger().set_timestamp(2_000);
+    client.resolve_appeal(&admin, &appeal_id, &false);
+
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::PermanentlyDenied);
+    assert_eq!(refund.rejected_at, Some(2_000));
+    assert_eq!(refund.appeal_deadline, None);
+
+    assert_eq!(client.get_refund_count_by_status(&RefundStatus::PendingAppeal), 0);
+    assert_eq!(client.get_refund_count_by_status(&RefundStatus::PermanentlyDenied), 1);
+
+    // The denial is final, so the cap usage it held is released.
+    assert_eq!(client.get_payment_refund_usage(&77u64), (0u32, 0i128));
+
+    // A permanently denied refund is terminal.
+    assert_eq!(
+        client.try_finalize_denial(&refund_id),
+        Err(Ok(Error::Core(CoreError::RefundNotRejected)))
+    );
+    assert_eq!(
+        client.try_approve_refund(&admin, &refund_id),
+        Err(Ok(Error::Core(CoreError::InvalidStatus)))
+    );
+    assert_eq!(
+        client.try_resolve_appeal(&admin, &appeal_id, &true),
+        Err(Ok(Error::Core(CoreError::AlreadyProcessed)))
+    );
+    assert_eq!(client.get_merchant_refund_summary(&refund.merchant).total_rejected, 1);
+}
+
+#[test]
+fn test_appeal_overturned_after_finalized_denial_reclaims_cap_usage() {
+    let env = Env::default();
+    let (client, admin, customer, _token, refund_id) = setup_denied_refund(&env);
+
+    let appeal_id = client.file_appeal(&customer, &refund_id, &String::from_str(&env, "photos"));
+
+    // The appeal window lapses while the appeal is pending; the denial is
+    // finalized and its cap usage released.
+    env.ledger().set_timestamp(1_000 + 604_800 + 1);
+    client.finalize_denial(&refund_id);
+    assert_eq!(client.get_refund(&refund_id).status, RefundStatus::Rejected);
+    assert_eq!(client.get_payment_refund_usage(&77u64), (0u32, 0i128));
+
+    client.resolve_appeal(&admin, &appeal_id, &true);
+
+    assert_eq!(client.get_refund(&refund_id).status, RefundStatus::Approved);
+    assert_eq!(client.get_refund_count_by_status(&RefundStatus::Rejected), 0);
+    assert_eq!(client.get_refund_count_by_status(&RefundStatus::Approved), 1);
+    assert_eq!(client.get_payment_refund_usage(&77u64), (1u32, 400i128));
+}
+
+#[test]
+fn test_appeal_upheld_after_finalized_denial_does_not_double_release_usage() {
+    let env = Env::default();
+    let (client, admin, customer, _token, refund_id) = setup_denied_refund(&env);
+
+    let appeal_id = client.file_appeal(&customer, &refund_id, &String::from_str(&env, "photos"));
+    env.ledger().set_timestamp(1_000 + 604_800 + 1);
+    client.finalize_denial(&refund_id);
+    let finalized_at = client.get_refund(&refund_id).rejected_at;
+
+    client.resolve_appeal(&admin, &appeal_id, &false);
+
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::PermanentlyDenied);
+    assert_eq!(refund.rejected_at, finalized_at);
+    assert_eq!(client.get_refund_count_by_status(&RefundStatus::Rejected), 0);
+    assert_eq!(client.get_refund_count_by_status(&RefundStatus::PermanentlyDenied), 1);
+    assert_eq!(client.get_payment_refund_usage(&77u64), (0u32, 0i128));
+}
+
+#[test]
+fn test_appeal_resolved_event_reports_outcome_and_refund_status() {
+    let env = Env::default();
+    let (client, admin, customer, _token, refund_id) = setup_denied_refund(&env);
+
+    let appeal_id = client.file_appeal(&customer, &refund_id, &String::from_str(&env, "photos"));
+    env.ledger().set_timestamp(2_000);
+    client.resolve_appeal(&admin, &appeal_id, &false);
+
+    let expected = AppealResolved {
+        appeal_id,
+        upheld: false,
+        resolved_at: 2_000,
+        refund_id,
+        outcome: AppealOutcome::Upheld,
+        refund_status: RefundStatus::PermanentlyDenied,
+    };
+    assert!(env.events().all().contains((
+        client.address.clone(),
+        soroban_sdk::Event::topics(&expected, &env),
+        soroban_sdk::Event::data(&expected, &env),
+    )));
 }

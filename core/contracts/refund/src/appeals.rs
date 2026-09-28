@@ -10,12 +10,27 @@ pub struct AppealFiled {
     pub appellant: Address,
 }
 
+/// Outcome of an appeal from the merchant's point of view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum AppealOutcome {
+    /// The customer won: the merchant's denial is overturned and the refund
+    /// moves to `Approved`, ready for payout via `process_refund`.
+    Overturned,
+    /// The merchant won: the denial is upheld and the refund becomes
+    /// `PermanentlyDenied`.
+    Upheld,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppealResolved {
     pub appeal_id: u64,
     pub upheld: bool,
     pub resolved_at: u64,
+    pub refund_id: u64,
+    pub outcome: AppealOutcome,
+    pub refund_status: RefundStatus,
 }
 
 // Issue #190: Dispute evidence attachment
@@ -269,20 +284,31 @@ impl RefundContract {
         Ok(appeal_id)
     }
 
-    /// Resolve an appeal by upholding or denying it.
+    /// Resolve an appeal and sync the underlying refund's status.
     ///
-    /// If upheld, the refund is approved and processed. If denied, the rejection becomes final.
-    /// Emits an `AppealResolved` event.
+    /// * `uphold == true` resolves in the customer's favour
+    ///   ([`AppealOutcome::Overturned`]): the merchant's denial is overturned
+    ///   and the refund moves to `Approved`, ready for payout via
+    ///   `process_refund`.
+    /// * `uphold == false` resolves in the merchant's favour
+    ///   ([`AppealOutcome::Upheld`]): the denial stands and the refund moves to
+    ///   the terminal `PermanentlyDenied` status.
+    ///
+    /// Emits an `AppealResolved` event carrying the outcome and the refund's
+    /// new status.
     ///
     /// # Arguments
     /// * `admin` - The admin address (must be authorized and be the contract admin).
     /// * `appeal_id` - The ID of the appeal to resolve.
-    /// * `uphold` - `true` to uphold the appeal (approve refund), `false` to deny.
+    /// * `uphold` - `true` to uphold the appeal (customer wins), `false` to deny it.
     ///
     /// # Errors
     /// Returns `Unauthorized` if the caller is not the admin.
     /// Returns `AlreadyProcessed` if the appeal is already resolved.
     /// Returns `RefundNotFound` if the appeal or refund does not exist.
+    /// Returns `RefundNotRejected` if the refund is no longer in a denied state.
+    /// Returns `RefundCountCapExceeded` / `RefundAmountCapExceeded` if overturning
+    /// a finalized denial would exceed the payment's refund cap.
     pub fn resolve_appeal(
         env: Env,
         admin: Address,
@@ -309,52 +335,52 @@ impl RefundContract {
             return Err(Error::Core(CoreError::AlreadyProcessed));
         }
 
-        if uphold {
-            let mut refund: Refund = env
-                .storage()
-                .instance()
-                .get(&DataKey::Refund(appeal.refund_id))
-                .ok_or(Error::Core(CoreError::RefundNotFound))?;
-            if refund.status != RefundStatus::Rejected
-                && refund.status != RefundStatus::PendingAppeal
-            {
-                return Err(Error::Core(CoreError::RefundNotRejected));
-            }
+        let mut refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(appeal.refund_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+        let prior_status = refund.status.clone();
+        if prior_status != RefundStatus::Rejected && prior_status != RefundStatus::PendingAppeal {
+            return Err(Error::Core(CoreError::RefundNotRejected));
+        }
 
-            let prior_status = refund.status.clone();
-            Self::remove_from_status_index(&env, prior_status, refund.id)?;
-            refund.status = RefundStatus::Approved;
-            env.storage()
-                .instance()
-                .set(&DataKey::Refund(refund.id), &refund);
-            Self::add_to_status_index(&env, RefundStatus::Approved, refund.id);
-
-            Self::process_refund_internal(&env, admin.clone(), refund.id)?;
+        let now = env.ledger().timestamp();
+        let (outcome, new_status) = if uphold {
+            (AppealOutcome::Overturned, RefundStatus::Approved)
         } else {
-            let mut refund: Refund = env
-                .storage()
-                .instance()
-                .get(&DataKey::Refund(appeal.refund_id))
-                .ok_or(Error::Core(CoreError::RefundNotFound))?;
-            if refund.status != RefundStatus::Rejected
-                && refund.status != RefundStatus::PendingAppeal
-            {
-                return Err(Error::Core(CoreError::RefundNotRejected));
-            }
+            (AppealOutcome::Upheld, RefundStatus::PermanentlyDenied)
+        };
 
-            // The appeal was explicitly denied, so the rejection is final
-            // now — no need to wait out the rest of the appeal window.
-            if refund.status == RefundStatus::PendingAppeal {
-                Self::remove_from_status_index(&env, RefundStatus::PendingAppeal, refund.id)?;
-                refund.status = RefundStatus::Rejected;
-                refund.rejected_at = Some(env.ledger().timestamp());
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Refund(refund.id), &refund);
-                Self::add_to_status_index(&env, RefundStatus::Rejected, refund.id);
+        // Payment refund-cap usage is held while a refund is Requested or
+        // PendingAppeal and released once the denial is final (Rejected).
+        match (&outcome, &prior_status) {
+            // A finalized denial already gave its usage back; reclaim it,
+            // respecting the cap, before the refund becomes payable again.
+            (AppealOutcome::Overturned, RefundStatus::Rejected) => {
+                Self::check_payment_refund_cap(&env, refund.payment_id, refund.amount)?;
+                Self::update_payment_refund_usage(&env, refund.payment_id, refund.amount);
+            }
+            // The denial becomes final now, so free the held usage.
+            (AppealOutcome::Upheld, RefundStatus::PendingAppeal) => {
                 Self::release_payment_refund_usage(&env, refund.payment_id, refund.amount);
             }
+            _ => {}
         }
+
+        Self::remove_from_status_index(&env, prior_status, refund.id)?;
+        refund.status = new_status.clone();
+        // The rejection fields stay as an audit trail of the original denial.
+        refund.appeal_deadline = None;
+        if outcome == AppealOutcome::Overturned {
+            refund.approved_at = Some(now);
+        } else if refund.rejected_at.is_none() {
+            refund.rejected_at = Some(now);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Refund(refund.id), &refund);
+        Self::add_to_status_index(&env, new_status.clone(), refund.id);
 
         appeal.resolved = true;
         appeal.outcome = Some(uphold);
@@ -362,10 +388,25 @@ impl RefundContract {
             .instance()
             .set(&SystemKey::Appeal(appeal_id), &appeal);
 
+        if outcome == AppealOutcome::Overturned {
+            (RefundApproved {
+                refund_id: refund.id,
+                payment_id: refund.payment_id,
+                amount: refund.amount,
+                approved_by: admin,
+                approved_at: now,
+            })
+            .publish(&env);
+            Self::invoke_hooks(&env, RefundEventType::Approved, refund.id);
+        }
+
         (AppealResolved {
             appeal_id,
             upheld: uphold,
-            resolved_at: env.ledger().timestamp(),
+            resolved_at: now,
+            refund_id: refund.id,
+            outcome,
+            refund_status: new_status,
         })
         .publish(&env);
 
