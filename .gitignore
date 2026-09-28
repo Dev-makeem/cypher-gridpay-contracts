@@ -8,3 +8,7 @@ target
 .codex
 
 **/test_snapshots/**
+
+# Jupyter notebooks (scratch files do not belong in contract sources)
+*.ipynb
+.ipynb_checkpoints/

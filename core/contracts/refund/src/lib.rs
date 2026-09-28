@@ -1938,7 +1938,7 @@ impl RefundContract {
             (RefundReasonCode::Other, other),
         ];
 
-        ordered.sort_by(|a, b| {
+        ordered.sort_unstable_by(|a, b| {
             let count_cmp = b.1.cmp(&a.1);
             if count_cmp == core::cmp::Ordering::Equal {
                 Self::reason_code_rank(&a.0).cmp(&Self::reason_code_rank(&b.0))
