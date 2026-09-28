@@ -535,15 +535,17 @@ pub struct CollateralReturned {
     pub amount: i128,
 }
 
+/// Published whenever a new escrow is funded and locked.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EscrowCreated {
+pub struct EscrowCreatedEvent {
     pub escrow_id: u64,
     pub customer: Address,
     pub merchant: Address,
     pub amount: i128,
     pub token: Address,
     pub release_timestamp: u64,
+    pub created_at: u64,
 }
 
 #[contractevent]
@@ -553,13 +555,20 @@ pub struct MultiPartyEscrowCreated {
     pub participant_count: u32,
 }
 
+/// Published when escrowed funds are released to the merchant (or a
+/// beneficiary override). `amount` is the gross escrow amount and
+/// `net_amount` is what the recipient received after platform fees.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EscrowReleased {
+pub struct EscrowReleasedEvent {
     pub escrow_id: u64,
+    pub customer: Address,
+    pub merchant: Address,
     pub recipient: Address,
     pub amount: i128,
+    pub net_amount: i128,
     pub token: Address,
+    pub released_at: u64,
 }
 
 #[contractevent]
@@ -608,13 +617,35 @@ pub struct MultiTokenEscrowReleased {
     pub token_count: u32,
 }
 
+/// Published when a party opens a dispute on a locked escrow.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EscrowDisputed {
+pub struct DisputeOpenedEvent {
     pub escrow_id: u64,
     pub disputed_by: Address,
+    pub customer: Address,
+    pub merchant: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub opened_at: u64,
 }
 
+/// Published when a dispute is settled, whether by an admin, a multisig
+/// proposal, the escalation timeout, or a final appeal ruling.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeResolvedEvent {
+    pub escrow_id: u64,
+    pub customer: Address,
+    pub merchant: Address,
+    pub winner: Address,
+    pub released_to_merchant: bool,
+    pub amount: i128,
+    pub token: Address,
+    pub resolved_at: u64,
+}
+
+/// Published when a non-disputed escrow is refunded to the customer.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowResolved {
@@ -2841,13 +2872,14 @@ impl EscrowContract {
 
         // Issue #398: emitting this event is what lets dashboards subscribe to
         // new-escrow notifications via Horizon instead of polling known escrow IDs.
-        EscrowCreated {
+        EscrowCreatedEvent {
             escrow_id,
             customer,
             merchant,
             amount,
             token,
             release_timestamp,
+            created_at: env.ledger().timestamp(),
         }
         .publish(&env);
 
@@ -3897,11 +3929,15 @@ impl EscrowContract {
             a.total_value_released += rel_amount;
         });
 
-        EscrowReleased {
+        EscrowReleasedEvent {
             escrow_id,
+            customer: escrow.customer,
+            merchant: escrow.merchant,
             recipient,
             amount: escrow.amount,
+            net_amount: merchant_amount,
             token: escrow.token,
+            released_at: current_time,
         }
         .publish(&env);
 
@@ -4097,9 +4133,14 @@ impl EscrowContract {
             a.total_disputes += 1;
         });
 
-        EscrowDisputed {
+        DisputeOpenedEvent {
             escrow_id,
             disputed_by: caller,
+            customer: escrow.customer,
+            merchant: escrow.merchant,
+            amount: escrow.amount,
+            token: escrow.token,
+            opened_at: escrow.dispute_started_at,
         }
         .publish(&env);
 
@@ -4625,10 +4666,15 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
         EscrowContract::update_reputation_on_dispute_outcome(&env, &winner, &loser);
-        EscrowResolved {
+        DisputeResolvedEvent {
             escrow_id,
+            customer: escrow.customer,
+            merchant: escrow.merchant,
+            winner,
             released_to_merchant: release_to_merchant,
             amount: escrow.amount,
+            token: escrow.token,
+            resolved_at: now,
         }
         .publish(&env);
         Ok(())
@@ -5007,10 +5053,15 @@ impl EscrowContract {
             a.total_resolutions += 1;
         });
 
-        EscrowResolved {
+        DisputeResolvedEvent {
             escrow_id,
+            customer: escrow.customer,
+            merchant: escrow.merchant,
+            winner,
             released_to_merchant: release_to_merchant,
             amount: escrow.amount,
+            token: escrow.token,
+            resolved_at: env.ledger().timestamp(),
         }
         .publish(&env);
 
@@ -5359,6 +5410,18 @@ impl EscrowContract {
         EscrowContract::update_merchant_analytics(&env, &escrow_mut.merchant, |a| {
             a.total_resolutions += 1;
         });
+
+        DisputeResolvedEvent {
+            escrow_id,
+            released_to_merchant: in_favour_of == escrow_mut.merchant,
+            customer: escrow_mut.customer,
+            merchant: escrow_mut.merchant,
+            winner: in_favour_of.clone(),
+            amount: escrow_mut.amount,
+            token: escrow_mut.token,
+            resolved_at: now,
+        }
+        .publish(&env);
 
         AppealResolved {
             appeal_id,
@@ -7203,11 +7266,15 @@ impl EscrowContract {
                     a.total_value_released += escrow.amount;
                 });
 
-                EscrowReleased {
+                EscrowReleasedEvent {
                     escrow_id,
+                    customer: escrow.customer.clone(),
+                    merchant: escrow.merchant.clone(),
                     recipient: escrow.merchant.clone(),
                     amount: escrow.amount,
+                    net_amount: merchant_amount,
                     token: escrow.token,
+                    released_at: current_time,
                 }
                 .publish(env);
             }
@@ -7286,10 +7353,15 @@ impl EscrowContract {
                     a.total_resolutions += 1;
                 });
 
-                EscrowResolved {
+                DisputeResolvedEvent {
                     escrow_id,
+                    customer: escrow.customer,
+                    merchant: escrow.merchant,
+                    winner,
                     released_to_merchant: release_to_merchant,
                     amount: escrow.amount,
+                    token: escrow.token,
+                    resolved_at: env.ledger().timestamp(),
                 }
                 .publish(env);
             }
@@ -9276,13 +9348,14 @@ impl EscrowContract {
             &conditional,
         );
 
-        EscrowCreated {
+        EscrowCreatedEvent {
             escrow_id,
             customer,
             merchant,
             amount,
             token,
             release_timestamp: u64::MAX,
+            created_at: env.ledger().timestamp(),
         }
         .publish(&env);
 
@@ -10101,13 +10174,14 @@ impl EscrowContract {
             a.total_value_locked += entry.amount;
         });
 
-        EscrowCreated {
+        EscrowCreatedEvent {
             escrow_id,
             customer: entry.customer.clone(),
             merchant: entry.merchant.clone(),
             amount: entry.amount,
             token: entry.token.clone(),
             release_timestamp: entry.release_timestamp,
+            created_at: env.ledger().timestamp(),
         }
         .publish(env);
 
@@ -11675,6 +11749,9 @@ mod appeal_expiry_test;
 
 #[cfg(test)]
 mod escalation_timeout_test;
+
+#[cfg(test)]
+mod events_test;
 //
 // mod health_check_test;
 //
